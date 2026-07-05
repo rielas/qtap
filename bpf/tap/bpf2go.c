@@ -19,6 +19,7 @@
  */
 
 #include "openssl.bpf.c"
+#include "nodetls.bpf.c"
 #include "process.bpf.c"
 #include "protocol.bpf.c"
 #include "socket.bpf.c"

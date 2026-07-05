@@ -25,6 +25,7 @@ import (
 	ebpfProcess "github.com/qpoint-io/qtap/pkg/ebpf/process"
 	"github.com/qpoint-io/qtap/pkg/ebpf/socket"
 	"github.com/qpoint-io/qtap/pkg/ebpf/tls"
+	"github.com/qpoint-io/qtap/pkg/ebpf/tls/nodetls"
 	"github.com/qpoint-io/qtap/pkg/ebpf/tls/openssl"
 	"github.com/qpoint-io/qtap/pkg/ebpf/trace"
 	"github.com/qpoint-io/qtap/pkg/kernel"
@@ -568,6 +569,11 @@ func InitTLSProbes(logger *zap.Logger, tlsProbesStr string, objs *tap.TapObjects
 		case "openssl":
 			probe := openssl.NewProbe(logger, NewEbpfOpenSSLprobesCreator(objs))
 			probes = append(probes, probe)
+			// NodeTLS rides along with OpenSSL. Node drives OpenSSL through a
+			// memory BIO, so the OpenSSL probe captures Node's plaintext but
+			// can't attribute it to a connection; this recovers the fd. It only
+			// attaches to detected Node processes, so it's inert otherwise.
+			probes = append(probes, nodetls.NewProbe(logger, NewEbpfNodeTLSprobesCreator(objs), objs.TapMaps.NodeTlswrapSymaddrsMap))
 		case "none", "":
 			enableTLS = false
 			logger.Info("No TLS probes enabled")
@@ -669,6 +675,22 @@ func NewEbpfOpenSSLprobesCreator(objs *tap.TapObjects) func() []*common.Uprobe {
 			common.NewUretprobe("SSL_write_ex", objs.TapPrograms.OpensslProbeRetSSL_writeEx),
 			common.NewUretprobe("SSL_new", objs.TapPrograms.OpensslProbeRetSSL_new),
 		}
+	}
+}
+
+// NewEbpfNodeTLSprobesCreator creates a function that returns the uprobes for
+// Node's TLSWrap member functions. The same entry/return programs are attached
+// to each TLSWrap symbol prefix (constructor, ClearIn, ClearOut).
+func NewEbpfNodeTLSprobesCreator(objs *tap.TapObjects) func() []*common.Uprobe {
+	return func() []*common.Uprobe {
+		var probes []*common.Uprobe
+		for _, prefix := range nodetls.TLSWrapSymbolPrefixes() {
+			probes = append(probes,
+				common.NewUprobe(prefix, objs.TapPrograms.NodetlsProbeEntryTLSWrapMemfn),
+				common.NewUretprobe(prefix, objs.TapPrograms.NodetlsProbeRetTLSWrapMemfn),
+			)
+		}
+		return probes
 	}
 }
 

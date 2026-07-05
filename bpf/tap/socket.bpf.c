@@ -660,6 +660,119 @@ static void init_conn(struct socket_ctx *ctx, enum DIRECTION direction, const st
 	}
 }
 
+// Resolve the struct socket* backing a fd in the *current* task, or 0 if the fd
+// is not an AF_INET/AF_INET6 socket. This lets us recover a connection whose
+// socket was handed to this process out-of-band -- e.g. Node's cluster mode
+// accepts a connection in the primary and passes the socket to a worker via
+// SCM_RIGHTS, so the worker's fd never went through this process's
+// accept()/connect() and has no conn_info. Reading it off the task's fd table
+// is namespace-independent and doesn't depend on catching the fd-passing event.
+// NOTE: reads here use bpf_core_read (CO-RE) rather than raw bpf_probe_read.
+// qtap compiles the rest of the BPF with -DBPF_NO_PRESERVE_ACCESS_INDEX (fixed
+// offsets from the bundled vmlinux.h), which is fine for the stable socket/sock
+// layouts but wrong for the highly kernel-specific task_struct/files_struct/
+// fdtable/file offsets. bpf_core_read emits CO-RE relocations that the loader
+// resolves against the running kernel's BTF, so the fd-table walk is correct
+// across kernels (requires kernel BTF, which is present on modern kernels).
+static __noinline uintptr_t resolve_inet_socket_from_fd(int fd) {
+	if (fd < 3)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (!task)
+		return 0;
+
+	struct files_struct *files = NULL;
+	bpf_core_read(&files, sizeof(files), &task->files);
+	if (!files)
+		return 0;
+
+	struct fdtable *fdt = NULL;
+	bpf_core_read(&fdt, sizeof(fdt), &files->fdt);
+	if (!fdt)
+		return 0;
+
+	unsigned int max_fds = 0;
+	bpf_core_read(&max_fds, sizeof(max_fds), &fdt->max_fds);
+	if ((unsigned int)fd >= max_fds)
+		return 0;
+
+	struct file **fd_array = NULL;
+	bpf_core_read(&fd_array, sizeof(fd_array), &fdt->fd);
+	if (!fd_array)
+		return 0;
+
+	struct file *file = NULL;
+	bpf_probe_read(&file, sizeof(file), &fd_array[fd]);
+	if (!file)
+		return 0;
+
+	// for socket files, private_data points at the struct socket
+	void *private_data = NULL;
+	bpf_core_read(&private_data, sizeof(private_data), &file->private_data);
+	if (!private_data)
+		return 0;
+
+	struct socket *sock = (struct socket *)private_data;
+
+	// validate it really is a socket: a socket back-references its own file
+	struct file *sock_file = NULL;
+	bpf_core_read(&sock_file, sizeof(sock_file), &sock->file);
+	if (sock_file != file)
+		return 0;
+
+	// must have a sk and be an IP socket (excludes AF_UNIX IPC, pipes, etc.)
+	struct sock *sk = NULL;
+	bpf_core_read(&sk, sizeof(sk), &sock->sk);
+	if (!sk)
+		return 0;
+
+	sa_family_t family = 0;
+	bpf_core_read(&family, sizeof(family), &sk->__sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	return (uintptr_t)sock;
+}
+
+// When data flows on a fd that has no conn_info -- e.g. a socket passed to this
+// process out-of-band (Node cluster worker) -- adopt the connection by reading
+// it straight off the socket. Returns the conn_info, or NULL if the fd is not
+// an adoptable inet socket.
+static __noinline struct conn_info *adopt_conn_from_sock(struct socket_ctx *ctx, enum DIRECTION direction) {
+	uintptr_t sock = resolve_inet_socket_from_fd(ctx->id->fd);
+	if (sock == 0)
+		return NULL;
+
+	// make the socket resolvable for submit_open_event and future lookups
+	bpf_map_update_elem(&pid_fd_to_sock_map, ctx->id, &sock, BPF_ANY);
+
+	// build a fresh conn_info. Whoever speaks first tells us the role: a server
+	// receives (ingress) first, a client sends (egress) first.
+	struct conn_info conn_info     = {};
+	conn_info.rd_bytes             = 0;
+	conn_info.wr_bytes             = 0;
+	conn_info.is_open              = false;
+	conn_info.is_ssl               = false;
+	conn_info.protocol             = P_UNKNOWN;
+	conn_info.conn_pid_id.pid      = ctx->id->pid;
+	conn_info.conn_pid_id.tgid     = (uint32_t)(ctx->pid_tgid & 0xFFFFFFFF);
+	conn_info.conn_pid_id.fd       = ctx->id->fd;
+	conn_info.conn_pid_id.tsid     = bpf_ktime_get_ns();
+	conn_info.conn_pid_id.function = (direction == D_INGRESS) ? C_SERVER : C_CLIENT;
+
+	bpf_map_update_elem(&conn_info_map, ctx->id, &conn_info, BPF_ANY);
+
+	struct conn_info *map_conn_info = bpf_map_lookup_elem(&conn_info_map, ctx->id);
+	if (map_conn_info == NULL)
+		return NULL;
+
+	// reads the real 4-tuple/cookie off the socket and marks the conn open
+	submit_open_event(ctx, map_conn_info);
+
+	return map_conn_info;
+}
+
 // common data handler for multiple syscall probes
 static __noinline void process_data(struct socket_ctx *ctx, enum DIRECTION direction, const struct data_args *args, ssize_t bytes, bool ssl) {
 	// nothing to do if the buffer is null
@@ -674,6 +787,13 @@ static __noinline void process_data(struct socket_ctx *ctx, enum DIRECTION direc
 
 	// lookup the connection
 	struct conn_info *conn_info = bpf_map_lookup_elem(&conn_info_map, ctx->id);
+
+	// no conn_info: this may be a socket handed to us out-of-band (e.g. a Node
+	// cluster worker that received an accepted socket via SCM_RIGHTS and so
+	// never called accept()). Try to adopt it straight off the socket.
+	if (conn_info == NULL) {
+		conn_info = adopt_conn_from_sock(ctx, direction);
+	}
 
 	// we need a connection
 	if (conn_info == NULL) {
